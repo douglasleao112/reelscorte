@@ -154,15 +154,22 @@ FORMATO DE RESPOSTA (JSON estrito):
 };
 
 // Corta trecho bruto
-const cutVideo = (inputPath, outputPath, start, end) => {
+const cutVideo = (inputPath, outputPath, start, end, speed = 1.0) => {
   return new Promise((resolve, reject) => {
     const dur = Math.max(end - start, 0.01);
+
+    const s = Number.isFinite(speed) && speed > 0 ? speed : 1.0;
+    const videoFilter = `setpts=${(1 / s).toFixed(6)}*PTS`;
+    const audioFilter = `atempo=${s}`;
+
     ffmpeg(inputPath)
       .setStartTime(start)
       .setDuration(dur)
       .output(outputPath)
       .videoCodec('libx264')
       .audioCodec('aac')
+      .videoFilters(videoFilter)
+      .audioFilters(audioFilter)
       .outputOptions(['-preset', 'ultrafast', '-crf', '28'])
       .on('end', () => resolve(outputPath))
       .on('error', reject)
@@ -324,9 +331,21 @@ app.post('/api/process-video', upload.single('video'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Nenhum vídeo enviado.' });
 
   const videoPath = req.file.path;
-  const { duration = '30s', prompt = '', theme = '', clipCount = '3' } = req.body;
 
-  const clipsN = Math.min(Math.max(parseInt(clipCount, 10) || 3, 1), 10); // 1..10
+  const {
+  duration = '30s',
+  prompt = '',
+  theme = '',
+  clipCount = '3',
+  videoSpeed = '1'
+} = req.body;
+
+// 🔒 aceita somente essas velocidades
+const allowed = new Set(['1', '1.2', '1.5', '1.7', '2']);
+const speedStr = String(videoSpeed).trim();
+const safeSpeed = allowed.has(speedStr) ? parseFloat(speedStr) : 1.0;
+
+  const clipsN = Math.min(Math.max(parseInt(clipCount, 10) || 3, 1), 10);
   const baseUrl = `${req.protocol}://${req.get('host')}`;
   const tempAudioPath = path.join(UPLOADS_DIR, `temp_audio_${Date.now()}.mp3`);
 
@@ -358,8 +377,8 @@ app.post('/api/process-video', upload.single('video'), async (req, res) => {
       const rawPath = path.join(OUTPUTS_DIR, rawFilename);
 
       // corte bruto
-      console.log(`Cortando bruto ${i + 1}: ${clip.start}s até ${clip.end}s`);
-      await cutVideo(videoPath, rawPath, clip.start, clip.end);
+     console.log(`Cortando bruto ${i + 1}: ${clip.start}s até ${clip.end}s (speed=${safeSpeed})`);
+    await cutVideo(videoPath, rawPath, clip.start, clip.end, safeSpeed);
 
       // remove silêncios
       const finalFilename = `corte_${Date.now()}_${i}.mp4`;
