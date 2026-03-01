@@ -95,7 +95,7 @@ const transcribeAudio = async (audioPath) => {
 };
 
 // IA escolhe os melhores cortes
-const analyzeContext = async (segments, prompt, theme, duration, clipCount) => {
+const analyzeContext = async (segments, prompt, duration, clipCount) => {
   console.log('Analisando contexto com GPT-4...');
 
   const systemPrompt = `Você é um editor de vídeo viral especialista e obcecado em retenção.
@@ -105,9 +105,8 @@ DIRETRIZES:
 - O corte DEVE ter sentido completo (início, meio e fim). Nunca cortar no meio de frase.
 - Duração alvo: aproximadamente ${duration}.
 - O primeiro 1-2s deve ter gancho (curiosidade, promessa, contradição, tensão, pergunta).
-- Tema desejado: ${theme || 'Qualquer tema interessante'}.
 - Instruções específicas do usuário: ${prompt || 'Nenhuma'}.
-- Se houver tema, priorize o tema. Se não houver, pegue os trechos mais fortes do vídeo.
+- Pegue os trechos mais fortes e interessantes do vídeo.
 - Evitar partes burocráticas: cumprimentos longos, “galera…”, “deixa eu te falar”, enrolação.
 - Priorize trechos com alta emoção, dicas valiosas, histórias curtas ou ganchos fortes.
 - Retorne EXATAMENTE ${clipCount} cortes.
@@ -332,20 +331,28 @@ app.post('/api/process-video', upload.single('video'), async (req, res) => {
 
   const videoPath = req.file.path;
 
-  const {
+  
+ 
+const {
   duration = '30s',
   prompt = '',
-  theme = '',
   clipCount = '3',
   videoSpeed = '1'
 } = req.body;
 
-// 🔒 aceita somente essas velocidades
-const allowed = new Set(['1', '1.2', '1.5', '1.7', '2']);
-const speedStr = String(videoSpeed).trim();
-const safeSpeed = allowed.has(speedStr) ? parseFloat(speedStr) : 1.0;
+// Permite qualquer velocidade entre 0.5 e 2.0 (para funcionar com a nova barra deslizante)
+const parsedSpeed = parseFloat(videoSpeed);
+const safeSpeed = (parsedSpeed >= 0.5 && parsedSpeed <= 2.0) ? parsedSpeed : 1.0;
 
-  const clipsN = Math.min(Math.max(parseInt(clipCount, 10) || 3, 1), 10);
+// Se o usuário clicou em "Max", definimos um limite alto (ex: 15). Senão, usamos o número escolhido.
+let clipsN = 15; 
+if (clipCount !== 'max') {
+  clipsN = Math.min(Math.max(parseInt(clipCount, 10) || 3, 1), 15);
+}
+
+
+
+
   const baseUrl = `${req.protocol}://${req.get('host')}`;
   const tempAudioPath = path.join(UPLOADS_DIR, `temp_audio_${Date.now()}.mp3`);
 
@@ -362,9 +369,9 @@ const safeSpeed = allowed.has(speedStr) ? parseFloat(speedStr) : 1.0;
     const segments = await transcribeAudio(tempAudioPath);
     if (!segments.length) throw new Error('Não foi possível detectar fala no vídeo.');
 
-    // 2) IA escolhe cortes
+  // 2) IA escolhe cortes
     console.log('Passo 2: Analisando com IA...');
-    const aiClips = await analyzeContext(segments, prompt, theme, duration, clipsN);
+    const aiClips = await analyzeContext(segments, prompt, duration, clipsN);
 
     // 3) gera cortes + remove silêncios
     console.log('Passo 3: Gerando cortes reais (com remoção de silêncios)...');
