@@ -234,7 +234,7 @@ app.post('/api/process-video', upload.single('video'), async (req, res) => {
     res
       .status(500)
       .json({ error: 'Erro ao processar vídeo', details: error.message });
-  }
+  } 
 });
 
 // Limpeza automática a cada 10 minutos (arquivos mais velhos que 30 min)
