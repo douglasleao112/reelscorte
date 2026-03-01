@@ -108,7 +108,6 @@ DIRETRIZES:
 - O corte DEVE ter sentido completo (início, meio e fim). Não corte no meio de uma frase.
 - Duração alvo: aproximadamente ${duration}.
  - O primeiro 1-2s deve ter gancho (curiosidade, promessa, contradição, tensão, pergunta).
-- Tema desejado: ${theme || 'Qualquer tema interessante'}.
 - Instruções específicas do usuário: ${prompt || 'Nenhuma'}.
 - Se houver tema, priorize o tema. Se não houver, pegue os trechos mais fortes do vídeo.
 - Evitar partes burocráticas: cumprimentos longos, “galera…”, “deixa eu te falar”, enrolação.

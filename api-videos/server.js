@@ -102,14 +102,15 @@ const analyzeContext = async (segments, prompt, duration, clipCount) => {
 Sua tarefa é analisar a transcrição e escolher trechos contínuos que virem cortes perfeitos para Reels/TikTok.
 
 DIRETRIZES:
-- O corte DEVE ter sentido completo (início, meio e fim). Nunca cortar no meio de frase.
+- O corte DEVE ter sentido completo (início, meio e fim). Não corte no meio de uma frase.
 - Duração alvo: aproximadamente ${duration}.
-- O primeiro 1-2s deve ter gancho (curiosidade, promessa, contradição, tensão, pergunta).
+- O primeiro 3-5s deve ter gancho (curiosidade, promessa, contradição, tensão, pergunta).
 - Instruções específicas do usuário: ${prompt || 'Nenhuma'}.
-- Pegue os trechos mais fortes e interessantes do vídeo.
+- Se houver tema, priorize o tema. Se não houver, pegue os trechos mais fortes do vídeo.
 - Evitar partes burocráticas: cumprimentos longos, “galera…”, “deixa eu te falar”, enrolação.
 - Priorize trechos com alta emoção, dicas valiosas, histórias curtas ou ganchos fortes.
 - Retorne EXATAMENTE ${clipCount} cortes.
+
 
 FORMATO DE RESPOSTA (JSON estrito):
 {
@@ -176,14 +177,6 @@ const cutVideo = (inputPath, outputPath, start, end, speed = 1.0) => {
   });
 };
 
-// -----------------------------------------
-// REMOVER SILÊNCIOS (implementação real)
-// Estratégia:
-// 1) Rodar silencedetect no CLIP já cortado
-// 2) Criar vários pedacinhos com fala
-// 3) Concatenar tudo num MP4 final
-// -----------------------------------------
-
 // Detecta intervalos com fala dentro de um arquivo
 const detectSpeechRanges = async (inputPath, noiseDb = -30, minSilence = 0.35) => {
   const cmd = `ffmpeg -i "${inputPath}" -af silencedetect=noise=${noiseDb}dB:d=${minSilence} -f null -`;
@@ -200,16 +193,14 @@ const detectSpeechRanges = async (inputPath, noiseDb = -30, minSilence = 0.35) =
     if (e) silenceEnds.push(parseFloat(e[1]));
   }
 
-  // se não detectou silencios, retorna null (não mexe)
   if (silenceStarts.length === 0 && silenceEnds.length === 0) return null;
 
-  // pega duração do arquivo
   const probeCmd = `ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "${inputPath}"`;
   const { stdout } = await execPromise(probeCmd);
   const totalDuration = Math.max(parseFloat(stdout.trim()) || 0, 0);
 
-  const pad = 0.12; // evita cortar sílabas
-  const minChunk = 0.35; // ignora trechos minúsculos
+  const pad = 0.12; 
+  const minChunk = 0.35; 
 
   const ranges = [];
   let cursor = 0;
@@ -225,7 +216,6 @@ const detectSpeechRanges = async (inputPath, noiseDb = -30, minSilence = 0.35) =
     cursor = Math.max(endSil + pad, cursor);
   }
 
-  // trecho final
   if (totalDuration > 0) {
     const a = Math.min(cursor, totalDuration);
     const b = totalDuration;
@@ -236,38 +226,21 @@ const detectSpeechRanges = async (inputPath, noiseDb = -30, minSilence = 0.35) =
   return ranges;
 };
 
-
 // Remove silêncios e garante um "respiro" entre falas (gap fixo)
 const removeSilences = async (inputPath, outputPath, gapMs = 850) => {
   const ranges = await detectSpeechRanges(inputPath);
 
-  // se não há ranges, copia o arquivo
   if (!ranges) {
     fs.copyFileSync(inputPath, outputPath);
     return outputPath;
   }
 
-  // monta comando ffmpeg com concat filter (vídeo + áudio) e gap entre trechos
-  // Ideia:
-  // - Para cada trecho: trim + setpts / atrim + asetpts
-  // - Antes de concatenar, "empurra" o áudio com adelay e o vídeo com tpad (preenche com último frame)
-  //   para gerar o gap desejado entre os blocos.
-  //
-  // Observação:
-  // - No vídeo: tpad=stop_mode=clone:stop_duration=0.85
-  // - No áudio: apad + atrim mantendo duração e adelay de 850ms (por trecho, exceto o primeiro)
-  //
-  // Isso cria um espacinho natural entre falas.
-
   const gapSec = (gapMs / 1000).toFixed(3);
-
-  // cria entrada repetida do mesmo arquivo para cada trecho
   const inputArgs = [];
   for (let i = 0; i < ranges.length; i++) {
     inputArgs.push(`-i "${inputPath}"`);
   }
 
-  // filter_complex
   const vLabels = [];
   const aLabels = [];
   const filters = [];
@@ -276,31 +249,18 @@ const removeSilences = async (inputPath, outputPath, gapMs = 850) => {
     const [start, end] = ranges[i];
     const dur = Math.max(end - start, 0.01);
 
-    // vídeo do trecho
-    // trim no intervalo + reset pts
     let vChain = `[${i}:v]trim=start=${start}:duration=${dur},setpts=PTS-STARTPTS`;
-
-    // adiciona gap no vídeo (exceto no último, mas pode manter também)
-    // tpad clone mantém o último frame por gapSec segundos
     vChain += `,tpad=stop_mode=clone:stop_duration=${gapSec}[v${i}]`;
     filters.push(vChain);
     vLabels.push(`[v${i}]`);
 
-    // áudio do trecho
     let aChain = `[${i}:a]atrim=start=${start}:duration=${dur},asetpts=PTS-STARTPTS`;
-
-    // adiciona gap no áudio: apad cria “silêncio”, depois atrim limita ao dur + gap
-    // e a gente mantém um espacinho entre os blocos.
     aChain += `,apad=pad_dur=${gapSec},atrim=duration=${(dur + parseFloat(gapSec)).toFixed(3)}[a${i}]`;
-
     filters.push(aChain);
     aLabels.push(`[a${i}]`);
   }
 
-  // concatena todos os blocos (n = quantidade de trechos)
-  // v=1 a=1 para concatenar vídeo e áudio juntos
   filters.push(`${vLabels.join('')}${aLabels.join('')}concat=n=${ranges.length}:v=1:a=1[outv][outa]`);
-
   const filterComplex = filters.join(';');
 
   const cmd =
@@ -312,13 +272,8 @@ const removeSilences = async (inputPath, outputPath, gapMs = 850) => {
     `"${outputPath}"`;
 
   await execPromise(cmd);
-
   return outputPath;
 };
-
-
-
-
 
 // =======================
 // ROTA PRINCIPAL
@@ -331,27 +286,22 @@ app.post('/api/process-video', upload.single('video'), async (req, res) => {
 
   const videoPath = req.file.path;
 
-  
- 
-const {
-  duration = '30s',
-  prompt = '',
-  clipCount = '3',
-  videoSpeed = '1'
-} = req.body;
+  const {
+    duration = '30s',
+    prompt = '',
+    clipCount = '3',
+    videoSpeed = '1'
+  } = req.body;
 
-// Permite qualquer velocidade entre 0.5 e 2.0 (para funcionar com a nova barra deslizante)
-const parsedSpeed = parseFloat(videoSpeed);
-const safeSpeed = (parsedSpeed >= 0.5 && parsedSpeed <= 2.0) ? parsedSpeed : 1.0;
+  // Permite qualquer velocidade entre 0.5 e 2.0
+  const parsedSpeed = parseFloat(videoSpeed);
+  const safeSpeed = (parsedSpeed >= 0.5 && parsedSpeed <= 2.0) ? parsedSpeed : 1.0;
 
-// Se o usuário clicou em "Max", definimos um limite alto (ex: 15). Senão, usamos o número escolhido.
-let clipsN = 15; 
-if (clipCount !== 'max') {
-  clipsN = Math.min(Math.max(parseInt(clipCount, 10) || 3, 1), 15);
-}
-
-
-
+  // Se o usuário clicou em "Max", definimos um limite alto (ex: 15). Senão, usamos o número escolhido.
+  let clipsN = 15; 
+  if (clipCount !== 'max') {
+    clipsN = Math.min(Math.max(parseInt(clipCount, 10) || 3, 1), 15);
+  }
 
   const baseUrl = `${req.protocol}://${req.get('host')}`;
   const tempAudioPath = path.join(UPLOADS_DIR, `temp_audio_${Date.now()}.mp3`);
@@ -369,7 +319,7 @@ if (clipCount !== 'max') {
     const segments = await transcribeAudio(tempAudioPath);
     if (!segments.length) throw new Error('Não foi possível detectar fala no vídeo.');
 
-  // 2) IA escolhe cortes
+    // 2) IA escolhe cortes
     console.log('Passo 2: Analisando com IA...');
     const aiClips = await analyzeContext(segments, prompt, duration, clipsN);
 
@@ -384,8 +334,8 @@ if (clipCount !== 'max') {
       const rawPath = path.join(OUTPUTS_DIR, rawFilename);
 
       // corte bruto
-     console.log(`Cortando bruto ${i + 1}: ${clip.start}s até ${clip.end}s (speed=${safeSpeed})`);
-    await cutVideo(videoPath, rawPath, clip.start, clip.end, safeSpeed);
+      console.log(`Cortando bruto ${i + 1}: ${clip.start}s até ${clip.end}s (speed=${safeSpeed})`);
+      await cutVideo(videoPath, rawPath, clip.start, clip.end, safeSpeed);
 
       // remove silêncios
       const finalFilename = `corte_${Date.now()}_${i}.mp4`;
@@ -417,10 +367,6 @@ if (clipCount !== 'max') {
 
     // limpa áudio temporário
     if (fs.existsSync(tempAudioPath)) fs.unlinkSync(tempAudioPath);
-
-    // opcional: apagar o vídeo original logo após gerar tudo (economiza MUITO espaço)
-    // se quiser isso, descomenta:
-    // if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
 
     console.log('Processamento concluído com sucesso!');
     return res.json({ success: true, clips: finalClips });
