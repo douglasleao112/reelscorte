@@ -240,7 +240,7 @@ app.post('/api/process-video', upload.single('video'), async (req, res) => {
 // Limpeza automática a cada 10 minutos (arquivos mais velhos que 30 min)
 setInterval(() => {
   const now = Date.now();
-  const maxAge = 30 * 60 * 1000; // 30 minutoss
+  const maxAge = 30 * 60 * 1000; // 30 minutos
 
   [UPLOADS_DIR, OUTPUTS_DIR].forEach((dir) => {
     fs.readdir(dir, (err, files) => {
