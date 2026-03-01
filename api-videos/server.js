@@ -33,7 +33,11 @@ app.use(cors({
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
+app.options('*', cors()); 
+
 app.use(express.json());
+
 app.use('/videos', express.static(OUTPUTS_DIR));
 
 app.get('/health', (req, res) => {
@@ -91,7 +95,7 @@ const transcribeAudio = async (audioPath) => {
 };
 
 // Analisa a transcrição com GPT-4 para encontrar os melhores cortes
-const analyzeContext = async (segments, prompt, theme, duration) => {
+const analyzeContext = async (segments, prompt, theme, duration, clipCount) => {
   console.log('Analisando contexto com GPT-4...');
 
   const systemPrompt = `Você é um editor de vídeo viral especialista e obcecado em retenção e viralização de conteúdo.
@@ -109,7 +113,7 @@ DIRETRIZES:
 - Se houver tema, priorize o tema. Se não houver, pegue os trechos mais fortes do vídeo.
 - Evitar partes burocráticas: cumprimentos longos, “galera…”, “deixa eu te falar”, enrolação.
 - Priorize trechos com alta emoção, dicas valiosas, histórias curtas ou ganchos fortes.
-- Retorne EXATAMENTE 3 cortes.
+- Retorne EXATAMENTE ${clipCount} cortes.
 
 FORMATO DE RESPOSTA (JSON estrito):
 {
@@ -138,7 +142,13 @@ FORMATO DE RESPOSTA (JSON estrito):
   });
 
   const content = response.choices[0].message.content;
-  return JSON.parse(content).clips;
+  const parsed = JSON.parse(content);
+
+if (!parsed.clips || !Array.isArray(parsed.clips)) {
+  throw new Error('Resposta da IA não retornou "clips" no formato esperado.');
+}
+
+return parsed.clips.slice(0, clipCount);
 };
 
 // Corta o vídeo usando FFmpeg com base nos timestamps
@@ -170,7 +180,12 @@ app.post('/api/process-video', upload.single('video'), async (req, res) => {
   }
 
   const videoPath = req.file.path;
-  const { duration = '30s', prompt = '', theme = '' } = req.body;
+ const { duration = '30s', prompt = '', theme = '', clipCount = '3' } = req.body;
+
+const clipsN = Math.min(Math.max(parseInt(clipCount, 10) || 3, 1), 10); 
+// limita de 1 a 10 pra evitar estouro de custo/tempo
+
+
   const baseUrl = `${req.protocol}://${req.get('host')}`;
   const tempAudioPath = path.join(UPLOADS_DIR, `temp_audio_${Date.now()}.mp3`);
 
@@ -194,7 +209,7 @@ app.post('/api/process-video', upload.single('video'), async (req, res) => {
 
     // PASSO 2: Analisar com GPT-4
     console.log('Passo 2: Analisando com IA...');
-    const aiClips = await analyzeContext(segments, prompt, theme, duration);
+    const aiClips = await analyzeContext(segments, prompt, theme, duration, clipsN);
 
     // PASSO 3: Cortar o vídeo com FFmpeg
     console.log('Passo 3: Gerando cortes reais...');
