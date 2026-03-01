@@ -230,8 +230,9 @@ const detectSpeechRanges = async (inputPath, noiseDb = -30, minSilence = 0.35) =
   return ranges;
 };
 
-// Remove silêncios (gera arquivo final)
-const removeSilences = async (inputPath, outputPath) => {
+
+// Remove silêncios e garante um "respiro" entre falas (gap fixo)
+const removeSilences = async (inputPath, outputPath, gapMs = 850) => {
   const ranges = await detectSpeechRanges(inputPath);
 
   // se não há ranges, copia o arquivo
@@ -240,42 +241,78 @@ const removeSilences = async (inputPath, outputPath) => {
     return outputPath;
   }
 
-  const stamp = Date.now();
-  const parts = [];
+  // monta comando ffmpeg com concat filter (vídeo + áudio) e gap entre trechos
+  // Ideia:
+  // - Para cada trecho: trim + setpts / atrim + asetpts
+  // - Antes de concatenar, "empurra" o áudio com adelay e o vídeo com tpad (preenche com último frame)
+  //   para gerar o gap desejado entre os blocos.
+  //
+  // Observação:
+  // - No vídeo: tpad=stop_mode=clone:stop_duration=0.85
+  // - No áudio: apad + atrim mantendo duração e adelay de 850ms (por trecho, exceto o primeiro)
+  //
+  // Isso cria um espacinho natural entre falas.
 
-  // 1) cria os pedacinhos
+  const gapSec = (gapMs / 1000).toFixed(3);
+
+  // cria entrada repetida do mesmo arquivo para cada trecho
+  const inputArgs = [];
+  for (let i = 0; i < ranges.length; i++) {
+    inputArgs.push(`-i "${inputPath}"`);
+  }
+
+  // filter_complex
+  const vLabels = [];
+  const aLabels = [];
+  const filters = [];
+
   for (let i = 0; i < ranges.length; i++) {
     const [start, end] = ranges[i];
     const dur = Math.max(end - start, 0.01);
 
-    const partPath = path.join(OUTPUTS_DIR, `speech_part_${stamp}_${i}.mp4`);
-    parts.push(partPath);
+    // vídeo do trecho
+    // trim no intervalo + reset pts
+    let vChain = `[${i}:v]trim=start=${start}:duration=${dur},setpts=PTS-STARTPTS`;
 
-    await new Promise((resolve, reject) => {
-      ffmpeg(inputPath)
-        .setStartTime(start)
-        .setDuration(dur)
-        .output(partPath)
-        .outputOptions(['-preset', 'ultrafast', '-crf', '28'])
-        .on('end', resolve)
-        .on('error', reject)
-        .run();
-    });
+    // adiciona gap no vídeo (exceto no último, mas pode manter também)
+    // tpad clone mantém o último frame por gapSec segundos
+    vChain += `,tpad=stop_mode=clone:stop_duration=${gapSec}[v${i}]`;
+    filters.push(vChain);
+    vLabels.push(`[v${i}]`);
+
+    // áudio do trecho
+    let aChain = `[${i}:a]atrim=start=${start}:duration=${dur},asetpts=PTS-STARTPTS`;
+
+    // adiciona gap no áudio: apad cria “silêncio”, depois atrim limita ao dur + gap
+    // e a gente mantém um espacinho entre os blocos.
+    aChain += `,apad=pad_dur=${gapSec},atrim=duration=${(dur + parseFloat(gapSec)).toFixed(3)}[a${i}]`;
+
+    filters.push(aChain);
+    aLabels.push(`[a${i}]`);
   }
 
-  // 2) concatena (concat demuxer)
-  const listPath = path.join(OUTPUTS_DIR, `concat_${stamp}.txt`);
-  fs.writeFileSync(listPath, parts.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'));
+  // concatena todos os blocos (n = quantidade de trechos)
+  // v=1 a=1 para concatenar vídeo e áudio juntos
+  filters.push(`${vLabels.join('')}${aLabels.join('')}concat=n=${ranges.length}:v=1:a=1[outv][outa]`);
 
-  const concatCmd = `ffmpeg -f concat -safe 0 -i "${listPath}" -c copy "${outputPath}"`;
-  await execPromise(concatCmd);
+  const filterComplex = filters.join(';');
 
-  // 3) limpa temporários
-  if (fs.existsSync(listPath)) fs.unlinkSync(listPath);
-  for (const p of parts) if (fs.existsSync(p)) fs.unlinkSync(p);
+  const cmd =
+    `ffmpeg -y ${inputArgs.join(' ')} ` +
+    `-filter_complex "${filterComplex}" ` +
+    `-map "[outv]" -map "[outa]" ` +
+    `-c:v libx264 -preset ultrafast -crf 28 ` +
+    `-c:a aac -b:a 128k ` +
+    `"${outputPath}"`;
+
+  await execPromise(cmd);
 
   return outputPath;
 };
+
+
+
+
 
 // =======================
 // ROTA PRINCIPAL
@@ -329,7 +366,7 @@ app.post('/api/process-video', upload.single('video'), async (req, res) => {
       const finalPath = path.join(OUTPUTS_DIR, finalFilename);
 
       console.log(`Removendo silêncios do corte ${i + 1}...`);
-      await removeSilences(rawPath, finalPath);
+      await removeSilences(rawPath, finalPath, 650);   // tempo do silencio entre o corte
 
       // apaga bruto para economizar espaço
       if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath);
