@@ -5,46 +5,45 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const { OpenAI } = require('openai');
-const { exec } = require('child_process');
 const util = require('util');
+const { exec } = require('child_process');
 
 const execPromise = util.promisify(exec);
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Configuração do OpenAI
-// IMPORTANTE: Você precisa configurar a variável OPENAI_API_KEY no EasyPanel
+// CORS
+app.use(
+  cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
+app.options('*', cors());
+app.use(express.json());
+
+// OpenAI
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// Configuração de pastas
+// Pastas
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 const OUTPUTS_DIR = path.join(__dirname, 'outputs');
 
-if (!fs.existsSync(UPLOADS_DIR))
-  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-if (!fs.existsSync(OUTPUTS_DIR))
-  fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
-
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
-
-app.options('*', cors()); 
-
-app.use(express.json());
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+if (!fs.existsSync(OUTPUTS_DIR)) fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
 
 app.use('/videos', express.static(OUTPUTS_DIR));
 
+// Health
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', message: 'Servidor rodando perfeitamente!' });
 });
 
-// Configuração do Multer para receber o vídeo
+// Multer
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOADS_DIR),
   filename: (req, file, cb) => {
@@ -54,60 +53,58 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({
-  storage: storage,
-  limits: { fileSize: 500 * 1024 * 1024 }, // Limite de 500MB
+  storage,
+  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB
 });
 
-// --- FUNÇÕES AUXILIARES ---
+// =======================
+// FUNÇÕES AUXILIARES
+// =======================
 
-// Extrai o áudio do vídeo para enviar ao Whisper (arquivos menores = menos RAM e banda)
+// Extrai áudio leve para Whisper
 const extractAudio = (videoPath, audioPath) => {
   return new Promise((resolve, reject) => {
     ffmpeg(videoPath)
       .output(audioPath)
       .noVideo()
       .audioCodec('libmp3lame')
-      .audioBitrate('64k') // Bitrate baixo para arquivo pequeno
+      .audioBitrate('64k')
       .on('end', () => resolve(audioPath))
-      .on('error', (err) => reject(err))
+      .on('error', reject)
       .run();
   });
 };
 
-// Transcreve o áudio usando OpenAI Whisper
+// Transcreve com Whisper (segmentos com timestamps)
 const transcribeAudio = async (audioPath) => {
   console.log('Iniciando transcrição com Whisper...');
   const transcription = await openai.audio.transcriptions.create({
     file: fs.createReadStream(audioPath),
     model: 'whisper-1',
-    response_format: 'verbose_json', // Retorna timestamps
+    response_format: 'verbose_json',
     timestamp_granularities: ['segment'],
   });
 
-  // Formata para o GPT-4 (apenas o necessário para economizar tokens)
-  const segments = transcription.segments.map((s) => ({
+  const segments = (transcription.segments || []).map((s) => ({
     start: s.start,
     end: s.end,
-    text: s.text.trim(),
+    text: (s.text || '').trim(),
   }));
 
   return segments;
 };
 
-// Analisa a transcrição com GPT-4 para encontrar os melhores cortes
+// IA escolhe os melhores cortes
 const analyzeContext = async (segments, prompt, theme, duration, clipCount) => {
   console.log('Analisando contexto com GPT-4...');
 
-  const systemPrompt = `Você é um editor de vídeo viral especialista e obcecado em retenção e viralização de conteúdo.
-Sua tarefa é analisar a transcrição de um vídeo e identificar os melhores trechos contínuos que formam cortes perfeitos para Reels/TikTok aonde as pessoas assistem até o fim. 
-
-IMPORTANTE: 
-- Remover os silêncios entre as falas, ajustar o enquadramento para acompanhar o movimento da cabeça do usuário e editar os cortes de forma fluida, unindo os trechos para manter a fala contínua e dinâmica.
+  const systemPrompt = `Você é um editor de vídeo viral especialista e obcecado em retenção.
+Sua tarefa é analisar a transcrição e escolher trechos contínuos que virem cortes perfeitos para Reels/TikTok.
 
 DIRETRIZES:
-- O corte DEVE ter sentido completo (início, meio e fim). Não corte no meio de uma frase.
+- O corte DEVE ter sentido completo (início, meio e fim). Nunca cortar no meio de frase.
 - Duração alvo: aproximadamente ${duration}.
- - O primeiro 1-2s deve ter gancho (curiosidade, promessa, contradição, tensão, pergunta).
+- O primeiro 1-2s deve ter gancho (curiosidade, promessa, contradição, tensão, pergunta).
 - Tema desejado: ${theme || 'Qualquer tema interessante'}.
 - Instruções específicas do usuário: ${prompt || 'Nenhuma'}.
 - Se houver tema, priorize o tema. Se não houver, pegue os trechos mais fortes do vídeo.
@@ -121,18 +118,22 @@ FORMATO DE RESPOSTA (JSON estrito):
     {
       "id": "1",
       "title": "Título chamativo (max 5 palavras)",
-      "description": "Por que este corte é bom com 90 a 110 caractéres",
-      "start": 12.5, // tempo em segundos (número)
-      "end": 45.2, // tempo em segundos (número)
-      "score": 95 // nota de 0 a 100 de quão viral isso pode ser
+      "description": "Por que este corte é bom (90 a 110 caracteres)",
+      "start": 12.5,
+      "end": 45.2,
+      "score": 95
     }
   ]
 }`;
 
-  const userMessage = `Aqui está a transcrição do vídeo com timestamps (em segundos):\n${JSON.stringify(segments, null, 2)}`;
+  const userMessage = `Aqui está a transcrição com timestamps (segundos):\n${JSON.stringify(
+    segments,
+    null,
+    2
+  )}`;
 
   const response = await openai.chat.completions.create({
-    model: 'gpt-4o', // Modelo mais inteligente para contexto
+    model: 'gpt-4o',
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userMessage },
@@ -141,90 +142,200 @@ FORMATO DE RESPOSTA (JSON estrito):
     temperature: 0.7,
   });
 
-  const content = response.choices[0].message.content;
+  const content = response.choices?.[0]?.message?.content || '{}';
   const parsed = JSON.parse(content);
 
-if (!parsed.clips || !Array.isArray(parsed.clips)) {
-  throw new Error('Resposta da IA não retornou "clips" no formato esperado.');
-}
+  if (!parsed.clips || !Array.isArray(parsed.clips)) {
+    throw new Error('Resposta da IA não retornou "clips" no formato esperado.');
+  }
 
-return parsed.clips.slice(0, clipCount);
+  // garante quantidade
+  return parsed.clips.slice(0, clipCount);
 };
 
-// Corta o vídeo usando FFmpeg com base nos timestamps
+// Corta trecho bruto
 const cutVideo = (inputPath, outputPath, start, end) => {
   return new Promise((resolve, reject) => {
-    const duration = end - start;
+    const dur = Math.max(end - start, 0.01);
     ffmpeg(inputPath)
       .setStartTime(start)
-      .setDuration(duration)
+      .setDuration(dur)
       .output(outputPath)
       .videoCodec('libx264')
       .audioCodec('aac')
-      // Otimizações para VPS fraca: preset ultrafast, crf alto (menor qualidade, mais rápido)
       .outputOptions(['-preset', 'ultrafast', '-crf', '28'])
       .on('end', () => resolve(outputPath))
-      .on('error', (err) => reject(err))
+      .on('error', reject)
       .run();
   });
 };
 
-// --- ROTA PRINCIPAL DA API ---
+// -----------------------------------------
+// REMOVER SILÊNCIOS (implementação real)
+// Estratégia:
+// 1) Rodar silencedetect no CLIP já cortado
+// 2) Criar vários pedacinhos com fala
+// 3) Concatenar tudo num MP4 final
+// -----------------------------------------
 
+// Detecta intervalos com fala dentro de um arquivo
+const detectSpeechRanges = async (inputPath, noiseDb = -30, minSilence = 0.35) => {
+  const cmd = `ffmpeg -i "${inputPath}" -af silencedetect=noise=${noiseDb}dB:d=${minSilence} -f null -`;
+  const { stderr } = await execPromise(cmd);
+
+  const silenceStarts = [];
+  const silenceEnds = [];
+
+  for (const line of stderr.split('\n')) {
+    const s = line.match(/silence_start:\s*([0-9.]+)/);
+    if (s) silenceStarts.push(parseFloat(s[1]));
+
+    const e = line.match(/silence_end:\s*([0-9.]+)/);
+    if (e) silenceEnds.push(parseFloat(e[1]));
+  }
+
+  // se não detectou silencios, retorna null (não mexe)
+  if (silenceStarts.length === 0 && silenceEnds.length === 0) return null;
+
+  // pega duração do arquivo
+  const probeCmd = `ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "${inputPath}"`;
+  const { stdout } = await execPromise(probeCmd);
+  const totalDuration = Math.max(parseFloat(stdout.trim()) || 0, 0);
+
+  const pad = 0.12; // evita cortar sílabas
+  const minChunk = 0.35; // ignora trechos minúsculos
+
+  const ranges = [];
+  let cursor = 0;
+
+  for (let i = 0; i < silenceStarts.length; i++) {
+    const startSil = silenceStarts[i];
+    const endSil = silenceEnds[i] ?? startSil;
+
+    const a = Math.max(cursor, 0);
+    const b = Math.max(startSil - pad, a);
+
+    if (b - a >= minChunk) ranges.push([a, b]);
+    cursor = Math.max(endSil + pad, cursor);
+  }
+
+  // trecho final
+  if (totalDuration > 0) {
+    const a = Math.min(cursor, totalDuration);
+    const b = totalDuration;
+    if (b - a >= minChunk) ranges.push([a, b]);
+  }
+
+  if (ranges.length === 0) return null;
+  return ranges;
+};
+
+// Remove silêncios (gera arquivo final)
+const removeSilences = async (inputPath, outputPath) => {
+  const ranges = await detectSpeechRanges(inputPath);
+
+  // se não há ranges, copia o arquivo
+  if (!ranges) {
+    fs.copyFileSync(inputPath, outputPath);
+    return outputPath;
+  }
+
+  const stamp = Date.now();
+  const parts = [];
+
+  // 1) cria os pedacinhos
+  for (let i = 0; i < ranges.length; i++) {
+    const [start, end] = ranges[i];
+    const dur = Math.max(end - start, 0.01);
+
+    const partPath = path.join(OUTPUTS_DIR, `speech_part_${stamp}_${i}.mp4`);
+    parts.push(partPath);
+
+    await new Promise((resolve, reject) => {
+      ffmpeg(inputPath)
+        .setStartTime(start)
+        .setDuration(dur)
+        .output(partPath)
+        .outputOptions(['-preset', 'ultrafast', '-crf', '28'])
+        .on('end', resolve)
+        .on('error', reject)
+        .run();
+    });
+  }
+
+  // 2) concatena (concat demuxer)
+  const listPath = path.join(OUTPUTS_DIR, `concat_${stamp}.txt`);
+  fs.writeFileSync(listPath, parts.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'));
+
+  const concatCmd = `ffmpeg -f concat -safe 0 -i "${listPath}" -c copy "${outputPath}"`;
+  await execPromise(concatCmd);
+
+  // 3) limpa temporários
+  if (fs.existsSync(listPath)) fs.unlinkSync(listPath);
+  for (const p of parts) if (fs.existsSync(p)) fs.unlinkSync(p);
+
+  return outputPath;
+};
+
+// =======================
+// ROTA PRINCIPAL
+// =======================
 app.post('/api/process-video', upload.single('video'), async (req, res) => {
   req.setTimeout(600000);
   res.setTimeout(600000);
 
-  if (!req.file) {
-    return res.status(400).json({ error: 'Nenhum vídeo enviado.' });
-  }
+  if (!req.file) return res.status(400).json({ error: 'Nenhum vídeo enviado.' });
 
   const videoPath = req.file.path;
- const { duration = '30s', prompt = '', theme = '', clipCount = '3' } = req.body;
+  const { duration = '30s', prompt = '', theme = '', clipCount = '3' } = req.body;
 
-const clipsN = Math.min(Math.max(parseInt(clipCount, 10) || 3, 1), 10); 
-// limita de 1 a 10 pra evitar estouro de custo/tempo
-
-
+  const clipsN = Math.min(Math.max(parseInt(clipCount, 10) || 3, 1), 10); // 1..10
   const baseUrl = `${req.protocol}://${req.get('host')}`;
   const tempAudioPath = path.join(UPLOADS_DIR, `temp_audio_${Date.now()}.mp3`);
 
   try {
-    if (!process.env.OPENAI_API_KEY) {
-      throw new Error('OPENAI_API_KEY não configurada no servidor.');
-    }
+    if (!process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY não configurada no servidor.');
 
     console.log(`Processando vídeo: ${req.file.filename}`);
 
-    // PASSO 1: Extrair áudio e Transcrever com Whisper
+    // 1) áudio + transcrição
     console.log('Passo 1: Extraindo áudio...');
     await extractAudio(videoPath, tempAudioPath);
 
     console.log('Passo 1: Transcrevendo...');
     const segments = await transcribeAudio(tempAudioPath);
+    if (!segments.length) throw new Error('Não foi possível detectar fala no vídeo.');
 
-    if (segments.length === 0) {
-      throw new Error('Não foi possível detectar fala no vídeo.');
-    }
-
-    // PASSO 2: Analisar com GPT-4
+    // 2) IA escolhe cortes
     console.log('Passo 2: Analisando com IA...');
     const aiClips = await analyzeContext(segments, prompt, theme, duration, clipsN);
 
-    // PASSO 3: Cortar o vídeo com FFmpeg
-    console.log('Passo 3: Gerando cortes reais...');
+    // 3) gera cortes + remove silêncios
+    console.log('Passo 3: Gerando cortes reais (com remoção de silêncios)...');
     const finalClips = [];
 
     for (let i = 0; i < aiClips.length; i++) {
       const clip = aiClips[i];
-      const outputFilename = `corte_${Date.now()}_${i}.mp4`;
-      const outputPath = path.join(OUTPUTS_DIR, outputFilename);
 
-      console.log(`Cortando trecho ${i + 1}: ${clip.start}s até ${clip.end}s`);
-      await cutVideo(videoPath, outputPath, clip.start, clip.end);
+      const rawFilename = `corte_raw_${Date.now()}_${i}.mp4`;
+      const rawPath = path.join(OUTPUTS_DIR, rawFilename);
 
-      // Calcula a duração real em formato mm:ss
-      const durationSecs = Math.round(clip.end - clip.start);
+      // corte bruto
+      console.log(`Cortando bruto ${i + 1}: ${clip.start}s até ${clip.end}s`);
+      await cutVideo(videoPath, rawPath, clip.start, clip.end);
+
+      // remove silêncios
+      const finalFilename = `corte_${Date.now()}_${i}.mp4`;
+      const finalPath = path.join(OUTPUTS_DIR, finalFilename);
+
+      console.log(`Removendo silêncios do corte ${i + 1}...`);
+      await removeSilences(rawPath, finalPath);
+
+      // apaga bruto para economizar espaço
+      if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath);
+
+      // duração aproximada (antes de remover silêncios)
+      const durationSecs = Math.max(Math.round(clip.end - clip.start), 0);
       const mins = Math.floor(durationSecs / 60);
       const secs = durationSecs % 60;
       const formattedDuration = `${mins}:${secs.toString().padStart(2, '0')}`;
@@ -237,48 +348,40 @@ const clipsN = Math.min(Math.max(parseInt(clipCount, 10) || 3, 1), 10);
         end: clip.end,
         duration: formattedDuration,
         score: clip.score,
-        url: `${baseUrl}/videos/${outputFilename}`,
+        url: `${baseUrl}/videos/${finalFilename}`,
       });
     }
 
-    console.log('Processamento concluído com sucesso!');
-
-    // Limpa o arquivo de áudio temporário
+    // limpa áudio temporário
     if (fs.existsSync(tempAudioPath)) fs.unlinkSync(tempAudioPath);
 
-    // Envia a resposta final
-    res.json({ success: true, clips: finalClips });
+    // opcional: apagar o vídeo original logo após gerar tudo (economiza MUITO espaço)
+    // se quiser isso, descomenta:
+    // if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+
+    console.log('Processamento concluído com sucesso!');
+    return res.json({ success: true, clips: finalClips });
   } catch (error) {
     console.error('Erro no processamento:', error);
-    // Limpa o arquivo de áudio temporário em caso de erro
     if (fs.existsSync(tempAudioPath)) fs.unlinkSync(tempAudioPath);
-    res
-      .status(500)
-      .json({ error: 'Erro ao processar vídeo', details: error.message });
-  } 
+    return res.status(500).json({ error: 'Erro ao processar vídeo', details: error.message });
+  }
 });
 
-// Limpeza automática a cada 10 minutos (arquivos mais velhos que 30 min)
+// Limpeza automática a cada 10 minutos (arquivos > 30 min)
 setInterval(() => {
   const now = Date.now();
-  const maxAge = 30 * 60 * 1000; // 30 minutos
+  const maxAge = 30 * 60 * 1000;
 
   [UPLOADS_DIR, OUTPUTS_DIR].forEach((dir) => {
     fs.readdir(dir, (err, files) => {
-      if (err) return console.error(`Erro ao ler diretório ${dir}:`, err);
-
+      if (err) return;
       files.forEach((file) => {
         const filePath = path.join(dir, file);
-        fs.stat(filePath, (err, stats) => {
-          if (err) return;
+        fs.stat(filePath, (err2, stats) => {
+          if (err2) return;
           if (now - stats.mtimeMs > maxAge) {
-            fs.unlink(filePath, (err) => {
-              if (err) console.error(`Erro ao deletar ${filePath}:`, err);
-              else
-                console.log(
-                  `Arquivo deletado por limpeza automática: ${filePath}`
-                );
-            });
+            fs.unlink(filePath, () => {});
           }
         });
       });
@@ -287,7 +390,5 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 app.listen(port, () => {
-  console.log(
-    `Servidor de processamento de vídeo com IA rodando na porta ${port}`
-  );
+  console.log(`Servidor de processamento de vídeo com IA rodando na porta ${port}`);
 });
