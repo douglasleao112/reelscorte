@@ -226,6 +226,7 @@ const detectSpeechRanges = async (inputPath, noiseDb = -30, minSilence = 0.35) =
   return ranges;
 };
 
+
 // Remove silêncios e garante um "respiro" entre falas (gap fixo)
 const removeSilences = async (inputPath, outputPath, gapMs = 850) => {
   const ranges = await detectSpeechRanges(inputPath);
@@ -241,9 +242,8 @@ const removeSilences = async (inputPath, outputPath, gapMs = 850) => {
     inputArgs.push(`-i "${inputPath}"`);
   }
 
-  const vLabels = [];
-  const aLabels = [];
   const filters = [];
+  let concatInputs = ''; // Variável para intercalar [v0][a0][v1][a1]
 
   for (let i = 0; i < ranges.length; i++) {
     const [start, end] = ranges[i];
@@ -252,15 +252,17 @@ const removeSilences = async (inputPath, outputPath, gapMs = 850) => {
     let vChain = `[${i}:v]trim=start=${start}:duration=${dur},setpts=PTS-STARTPTS`;
     vChain += `,tpad=stop_mode=clone:stop_duration=${gapSec}[v${i}]`;
     filters.push(vChain);
-    vLabels.push(`[v${i}]`);
 
     let aChain = `[${i}:a]atrim=start=${start}:duration=${dur},asetpts=PTS-STARTPTS`;
     aChain += `,apad=pad_dur=${gapSec},atrim=duration=${(dur + parseFloat(gapSec)).toFixed(3)}[a${i}]`;
     filters.push(aChain);
-    aLabels.push(`[a${i}]`);
+
+    // Intercala vídeo e áudio corretamente para o filtro concat
+    concatInputs += `[v${i}][a${i}]`;
   }
 
-  filters.push(`${vLabels.join('')}${aLabels.join('')}concat=n=${ranges.length}:v=1:a=1[outv][outa]`);
+  // Aplica a string intercalada no concat
+  filters.push(`${concatInputs}concat=n=${ranges.length}:v=1:a=1[outv][outa]`);
   const filterComplex = filters.join(';');
 
   const cmd =
@@ -274,6 +276,9 @@ const removeSilences = async (inputPath, outputPath, gapMs = 850) => {
   await execPromise(cmd);
   return outputPath;
 };
+
+
+
 
 // =======================
 // ROTA PRINCIPAL
