@@ -94,16 +94,22 @@ const transcribeAudio = async (audioPath) => {
 const analyzeContext = async (segments, prompt, theme, duration) => {
   console.log('Analisando contexto com GPT-4...');
 
-  const systemPrompt = `Você é um editor de vídeo viral especialista em retenção.
-Sua tarefa é analisar a transcrição de um vídeo e identificar os melhores trechos contínuos que formam cortes perfeitos para Reels/TikTok.
+  const systemPrompt = `Você é um editor de vídeo viral especialista e obcecado em retenção e viralização de conteúdo.
+Sua tarefa é analisar a transcrição de um vídeo e identificar os melhores trechos contínuos que formam cortes perfeitos para Reels/TikTok aonde as pessoas assistem até o fim. 
+
+IMPORTANTE: 
+- Remover os silêncios entre as falas, ajustar o enquadramento para acompanhar o movimento da cabeça do usuário e editar os cortes de forma fluida, unindo os trechos para manter a fala contínua e dinâmica.
 
 DIRETRIZES:
-1. O corte DEVE ter sentido completo (início, meio e fim). Não corte no meio de uma frase.
-2. Duração alvo: aproximadamente ${duration}.
-3. Tema desejado: ${theme || 'Qualquer tema interessante'}.
-4. Instruções específicas do usuário: ${prompt || 'Nenhuma'}.
-5. Priorize trechos com alta emoção, dicas valiosas, histórias curtas ou ganchos fortes.
-6. Retorne EXATAMENTE 3 cortes.
+- O corte DEVE ter sentido completo (início, meio e fim). Não corte no meio de uma frase.
+- Duração alvo: aproximadamente ${duration}.
+ - O primeiro 1-2s deve ter gancho (curiosidade, promessa, contradição, tensão, pergunta).
+- Tema desejado: ${theme || 'Qualquer tema interessante'}.
+- Instruções específicas do usuário: ${prompt || 'Nenhuma'}.
+- Se houver tema, priorize o tema. Se não houver, pegue os trechos mais fortes do vídeo.
+- Evitar partes burocráticas: cumprimentos longos, “galera…”, “deixa eu te falar”, enrolação.
+- Priorize trechos com alta emoção, dicas valiosas, histórias curtas ou ganchos fortes.
+- Retorne EXATAMENTE 3 cortes.
 
 FORMATO DE RESPOSTA (JSON estrito):
 {
@@ -111,7 +117,7 @@ FORMATO DE RESPOSTA (JSON estrito):
     {
       "id": "1",
       "title": "Título chamativo (max 5 palavras)",
-      "description": "Por que este corte é bom",
+      "description": "Por que este corte é bom com 90 a 110 caractéres",
       "start": 12.5, // tempo em segundos (número)
       "end": 45.2, // tempo em segundos (número)
       "score": 95 // nota de 0 a 100 de quão viral isso pode ser
