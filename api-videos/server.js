@@ -36,7 +36,14 @@ const OUTPUTS_DIR = path.join(__dirname, 'outputs');
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 if (!fs.existsSync(OUTPUTS_DIR)) fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
 
-app.use('/videos', express.static(OUTPUTS_DIR));
+// Servir vídeos com cabeçalhos CORS para permitir download direto
+app.use('/videos', express.static(OUTPUTS_DIR, {
+  setHeaders: (res, path, stat) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.set('Cross-Origin-Resource-Policy', 'cross-origin');
+  }
+}));
 
 // Health
 app.get('/health', (req, res) => {
@@ -103,14 +110,13 @@ Sua tarefa é analisar a transcrição e escolher trechos contínuos que virem c
 
 DIRETRIZES:
 - O corte DEVE ter sentido completo (início, meio e fim). Não corte no meio de uma frase.
-- Duração alvo: aproximadamente ${duration}.
+- Duração alvo de CADA corte: ${duration}. (Tente ao máximo respeitar essa janela de tempo).
 - O primeiro 3-5s deve ter gancho (curiosidade, promessa, contradição, tensão, pergunta).
 - Instruções específicas do usuário: ${prompt || 'Nenhuma'}.
 - Se houver tema, priorize o tema. Se não houver, pegue os trechos mais fortes do vídeo.
 - Evitar partes burocráticas: cumprimentos longos, “galera…”, “deixa eu te falar”, enrolação.
 - Priorize trechos com alta emoção, dicas valiosas, histórias curtas ou ganchos fortes.
-- Retorne EXATAMENTE ${clipCount} cortes.
-
+- Retorne EXATAMENTE ${clipCount} cortes (ou o máximo possível se o vídeo for curto).
 
 FORMATO DE RESPOSTA (JSON estrito):
 {
@@ -153,14 +159,36 @@ FORMATO DE RESPOSTA (JSON estrito):
   return parsed.clips.slice(0, clipCount);
 };
 
-// Corta trecho bruto
-const cutVideo = (inputPath, outputPath, start, end, speed = 1.0) => {
+// Gera o filtro de corte do FFmpeg com base na proporção
+const getCropFilter = (aspectRatio) => {
+  let wRatio, hRatio;
+  switch (aspectRatio) {
+    case '9:16': wRatio = 9; hRatio = 16; break;
+    case '1:1': wRatio = 1; hRatio = 1; break;
+    case '4:5': wRatio = 4; hRatio = 5; break;
+    case '16:9': wRatio = 16; hRatio = 9; break;
+    default: return null;
+  }
+  // Corta o centro do vídeo mantendo a proporção exata escolhida
+  return `crop=w='min(iw,ih*(${wRatio}/${hRatio}))':h='min(ih,iw*(${hRatio}/${wRatio}))':x='(iw-w)/2':y='(ih-h)/2'`;
+};
+
+// Corta trecho bruto e aplica proporção
+const cutVideo = (inputPath, outputPath, start, end, speed = 1.0, aspectRatio = null) => {
   return new Promise((resolve, reject) => {
     const dur = Math.max(end - start, 0.01);
 
     const s = Number.isFinite(speed) && speed > 0 ? speed : 1.0;
-    const videoFilter = `setpts=${(1 / s).toFixed(6)}*PTS`;
+    const speedFilter = `setpts=${(1 / s).toFixed(6)}*PTS`;
     const audioFilter = `atempo=${s}`;
+
+    const vFilters = [speedFilter];
+    
+    // Adiciona o filtro de proporção (crop) se existir
+    const cropFilter = getCropFilter(aspectRatio);
+    if (cropFilter) {
+      vFilters.push(cropFilter);
+    }
 
     ffmpeg(inputPath)
       .setStartTime(start)
@@ -168,7 +196,7 @@ const cutVideo = (inputPath, outputPath, start, end, speed = 1.0) => {
       .output(outputPath)
       .videoCodec('libx264')
       .audioCodec('aac')
-      .videoFilters(videoFilter)
+      .videoFilters(vFilters)
       .audioFilters(audioFilter)
       .outputOptions(['-preset', 'ultrafast', '-crf', '28'])
       .on('end', () => resolve(outputPath))
@@ -233,7 +261,6 @@ const detectSpeechRanges = async (inputPath, noiseDb = -30, minSilence = 0.35) =
 
 
 // Remove silêncios mantendo "tail/respiro" (ex: +650ms de vídeo real após cada fala)
-// Sem inserir silêncio, sem clonar frame.
 const removeSilences = async (inputPath, outputPath, tailMs = 650) => {
   const ranges = await detectSpeechRanges(inputPath);
 
@@ -322,14 +349,6 @@ const removeSilences = async (inputPath, outputPath, tailMs = 650) => {
   return outputPath;
 };
 
-
-
-
-
-
-
-
-
 // =======================
 // ROTA PRINCIPAL
 // =======================
@@ -342,20 +361,21 @@ app.post('/api/process-video', upload.single('video'), async (req, res) => {
   const videoPath = req.file.path;
 
   const {
-    duration = '30s',
+    duration = '<30s',
     prompt = '',
-    clipCount = '3',
-    videoSpeed = '1'
+    videoCount = '3',
+    videoSpeed = '1',
+    aspectRatio = '9:16'
   } = req.body;
 
   // Permite qualquer velocidade entre 0.5 e 2.0
   const parsedSpeed = parseFloat(videoSpeed);
   const safeSpeed = (parsedSpeed >= 0.5 && parsedSpeed <= 2.0) ? parsedSpeed : 1.0;
 
-  // Se o usuário clicou em "Max", definimos um limite alto (ex: 15). Senão, usamos o número escolhido.
+  // Se o usuário clicou em "Max.", definimos um limite alto (ex: 15). Senão, usamos o número escolhido.
   let clipsN = 15; 
-  if (clipCount !== 'max') {
-    clipsN = Math.min(Math.max(parseInt(clipCount, 10) || 3, 1), 15);
+  if (videoCount && videoCount.toLowerCase() !== 'max.') {
+    clipsN = Math.min(Math.max(parseInt(videoCount, 10) || 3, 1), 15);
   }
 
   const baseUrl = `${req.protocol}://${req.get('host')}`;
@@ -365,6 +385,7 @@ app.post('/api/process-video', upload.single('video'), async (req, res) => {
     if (!process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY não configurada no servidor.');
 
     console.log(`Processando vídeo: ${req.file.filename}`);
+    console.log(`Configurações: Duração=${duration}, Quantidade=${clipsN}, Proporção=${aspectRatio}`);
 
     // 1) áudio + transcrição
     console.log('Passo 1: Extraindo áudio...');
@@ -379,7 +400,7 @@ app.post('/api/process-video', upload.single('video'), async (req, res) => {
     const aiClips = await analyzeContext(segments, prompt, duration, clipsN);
 
     // 3) gera cortes + remove silêncios
-    console.log('Passo 3: Gerando cortes reais (com remoção de silêncios)...');
+    console.log('Passo 3: Gerando cortes reais (com remoção de silêncios e crop)...');
     const finalClips = [];
 
     for (let i = 0; i < aiClips.length; i++) {
@@ -388,9 +409,9 @@ app.post('/api/process-video', upload.single('video'), async (req, res) => {
       const rawFilename = `corte_raw_${Date.now()}_${i}.mp4`;
       const rawPath = path.join(OUTPUTS_DIR, rawFilename);
 
-      // corte bruto
-      console.log(`Cortando bruto ${i + 1}: ${clip.start}s até ${clip.end}s (speed=${safeSpeed})`);
-      await cutVideo(videoPath, rawPath, clip.start, clip.end, safeSpeed);
+      // corte bruto com proporção (crop)
+      console.log(`Cortando bruto ${i + 1}: ${clip.start}s até ${clip.end}s (speed=${safeSpeed}, aspect=${aspectRatio})`);
+      await cutVideo(videoPath, rawPath, clip.start, clip.end, safeSpeed, aspectRatio);
 
       // remove silêncios
       const finalFilename = `corte_${Date.now()}_${i}.mp4`;
