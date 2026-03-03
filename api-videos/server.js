@@ -193,15 +193,18 @@ const detectSpeechRanges = async (inputPath, noiseDb = -30, minSilence = 0.35) =
     if (e) silenceEnds.push(parseFloat(e[1]));
   }
 
-  if (silenceStarts.length === 0 && silenceEnds.length === 0) return null;
-
+  // Se não achou silêncio, assume que é tudo fala
   const probeCmd = `ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "${inputPath}"`;
   const { stdout } = await execPromise(probeCmd);
   const totalDuration = Math.max(parseFloat(stdout.trim()) || 0, 0);
 
-  const pad = 0.12; 
-  const minChunk = 0.35; 
+  if (totalDuration <= 0) return null;
 
+  if (silenceStarts.length === 0 && silenceEnds.length === 0) {
+    return [[0, totalDuration]];
+  }
+
+  // ranges de "fala" são os espaços ENTRE silêncios
   const ranges = [];
   let cursor = 0;
 
@@ -210,72 +213,119 @@ const detectSpeechRanges = async (inputPath, noiseDb = -30, minSilence = 0.35) =
     const endSil = silenceEnds[i] ?? startSil;
 
     const a = Math.max(cursor, 0);
-    const b = Math.max(startSil - pad, a);
+    const b = Math.min(startSil, totalDuration);
 
-    if (b - a >= minChunk) ranges.push([a, b]);
-    cursor = Math.max(endSil + pad, cursor);
+    if (b > a) ranges.push([a, b]);
+
+    cursor = Math.min(Math.max(endSil, cursor), totalDuration);
   }
 
-  if (totalDuration > 0) {
-    const a = Math.min(cursor, totalDuration);
-    const b = totalDuration;
-    if (b - a >= minChunk) ranges.push([a, b]);
+  if (cursor < totalDuration) {
+    ranges.push([cursor, totalDuration]);
   }
 
-  if (ranges.length === 0) return null;
-  return ranges;
+  // remove pedaços muito curtos (evita micro-cortes)
+  const minChunk = 0.18; // ajuste fino
+  const filtered = ranges.filter(([a, b]) => (b - a) >= minChunk);
+
+  return filtered.length ? filtered : null;
 };
 
 
-// Remove silêncios e garante um "respiro" entre falas (gap fixo)
-const removeSilences = async (inputPath, outputPath, gapMs = 850) => {
+// Remove silêncios mantendo "tail/respiro" (ex: +650ms de vídeo real após cada fala)
+// Sem inserir silêncio, sem clonar frame.
+const removeSilences = async (inputPath, outputPath, tailMs = 650) => {
   const ranges = await detectSpeechRanges(inputPath);
 
-  if (!ranges) {
+  if (!ranges || ranges.length === 0) {
     fs.copyFileSync(inputPath, outputPath);
     return outputPath;
   }
 
-  const gapSec = (gapMs / 1000).toFixed(3);
-  const inputArgs = [];
-  for (let i = 0; i < ranges.length; i++) {
-    inputArgs.push(`-i "${inputPath}"`);
+  // duração total (pra clamp)
+  const probeCmd = `ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "${inputPath}"`;
+  const { stdout } = await execPromise(probeCmd);
+  const totalDuration = Math.max(parseFloat(stdout.trim()) || 0, 0);
+
+  const tailSec = tailMs / 1000;
+
+  // 1) estende o final de cada fala em +tailSec
+  // 2) evita overlap: se encostar no próximo trecho, a gente "cola" e depois mescla
+  const extended = ranges.map(([start, end]) => {
+    const newEnd = Math.min(end + tailSec, totalDuration);
+    return [Math.max(0, start), Math.max(start, newEnd)];
+  });
+
+  // Mescla ranges que se sobrepõem/encostam (pra não dar micro-corte desnecessário)
+  extended.sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const [s, e] of extended) {
+    if (!merged.length) {
+      merged.push([s, e]);
+      continue;
+    }
+    const last = merged[merged.length - 1];
+    // se o próximo começa antes do último acabar (ou muito perto), mescla
+    if (s <= last[1] + 0.02) {
+      last[1] = Math.max(last[1], e);
+    } else {
+      merged.push([s, e]);
+    }
   }
 
-  const filters = [];
-  let concatInputs = ''; // Variável para intercalar [v0][a0][v1][a1]
+  // Se sobrou só 1 range, só recorta e pronto
+  if (merged.length === 1) {
+    const [s, e] = merged[0];
+    const dur = Math.max(e - s, 0.01);
+    const cmd =
+      `ffmpeg -y -i "${inputPath}" ` +
+      `-ss ${s.toFixed(3)} -t ${dur.toFixed(3)} ` +
+      `-c:v libx264 -preset ultrafast -crf 28 ` +
+      `-c:a aac -b:a 128k -movflags +faststart ` +
+      `"${outputPath}"`;
+    await execPromise(cmd);
+    return outputPath;
+  }
 
-  for (let i = 0; i < ranges.length; i++) {
-    const [start, end] = ranges[i];
+  // Monta filter_complex com 1 input só
+  const filters = [];
+  let concatInputs = '';
+
+  merged.forEach(([start, end], i) => {
     const dur = Math.max(end - start, 0.01);
 
-    let vChain = `[${i}:v]trim=start=${start}:duration=${dur},setpts=PTS-STARTPTS`;
-    vChain += `,tpad=stop_mode=clone:stop_duration=${gapSec}[v${i}]`;
-    filters.push(vChain);
+    // vídeo
+    filters.push(
+      `[0:v]trim=start=${start.toFixed(3)}:duration=${dur.toFixed(3)},setpts=PTS-STARTPTS[v${i}]`
+    );
 
-    let aChain = `[${i}:a]atrim=start=${start}:duration=${dur},asetpts=PTS-STARTPTS`;
-    aChain += `,apad=pad_dur=${gapSec},atrim=duration=${(dur + parseFloat(gapSec)).toFixed(3)}[a${i}]`;
-    filters.push(aChain);
+    // áudio
+    filters.push(
+      `[0:a]atrim=start=${start.toFixed(3)}:duration=${dur.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`
+    );
 
-    // Intercala vídeo e áudio corretamente para o filtro concat
     concatInputs += `[v${i}][a${i}]`;
-  }
+  });
 
-  // Aplica a string intercalada no concat
-  filters.push(`${concatInputs}concat=n=${ranges.length}:v=1:a=1[outv][outa]`);
+  filters.push(`${concatInputs}concat=n=${merged.length}:v=1:a=1[outv][outa]`);
   const filterComplex = filters.join(';');
 
   const cmd =
-    `ffmpeg -y ${inputArgs.join(' ')} ` +
+    `ffmpeg -y -i "${inputPath}" ` +
     `-filter_complex "${filterComplex}" ` +
     `-map "[outv]" -map "[outa]" ` +
     `-c:v libx264 -preset ultrafast -crf 28 ` +
-    `-c:a aac -b:a 128k ` +
+    `-c:a aac -b:a 128k -movflags +faststart ` +
     `"${outputPath}"`;
 
   await execPromise(cmd);
   return outputPath;
 };
+
+
+
+
+
 
 
 
