@@ -11,7 +11,7 @@ const util = require("util");
 const execPromise = util.promisify(exec);
 
 const app = express();
-const port = 3000; // Mantenha 80 se for subir no EasyPanel, mas o usuário pediu 3000 no prompt atual. Vou usar 3000 como pedido.
+const port = 80; 
 
 // Configuração do OpenAI
 // Certifique-se de configurar a variável de ambiente OPENAI_API_KEY na sua VPS
