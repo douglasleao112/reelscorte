@@ -162,7 +162,7 @@ const cutVideo = (inputPath, outputPath, start, end) => {
       .run();
   });
 };
-
+ 
 // --- ROTA PRINCIPAL DA API ---
 
 app.post("/api/process-video", upload.single("video"), async (req, res) => {
