@@ -397,7 +397,7 @@ app.post('/api/process-video', upload.single('video'), async (req, res) => {
       const finalPath = path.join(OUTPUTS_DIR, finalFilename);
 
       console.log(`Removendo silêncios do corte ${i + 1}...`);
-      await removeSilences(rawPath, finalPath, 650);   // tempo do silencio entre o corte
+      await removeSilences(rawPath, finalPath, 500);   // tempo do silencio entre o corte
 
       // apaga bruto para economizar espaço
       if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath);
