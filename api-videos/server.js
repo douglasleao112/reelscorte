@@ -280,3 +280,4 @@ app.listen(port, () => {
     `Servidor de processamento de vídeo com IA rodando na porta ${port}`,
   );
 });
+ 
