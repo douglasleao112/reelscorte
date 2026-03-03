@@ -163,150 +163,6 @@ const cutVideo = (inputPath, outputPath, start, end) => {
   });
 };
 
-
-
-// Detecta intervalos com fala dentro de um arquivo (com base nos silêncios)
-const detectSpeechRanges = async (inputPath, noiseDb = -35, minSilence = 0.25) => {
-  const cmd = `ffmpeg -i "${inputPath}" -af silencedetect=noise=${noiseDb}dB:d=${minSilence} -f null -`;
-  const { stderr } = await execPromise(cmd);
-
-  const silenceStarts = [];
-  const silenceEnds = [];
-
-  for (const line of stderr.split("\n")) {
-    const s = line.match(/silence_start:\s*([0-9.]+)/);
-    if (s) silenceStarts.push(parseFloat(s[1]));
-
-    const e = line.match(/silence_end:\s*([0-9.]+)/);
-    if (e) silenceEnds.push(parseFloat(e[1]));
-  }
-
-  // duração total
-  const probeCmd = `ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "${inputPath}"`;
-  const { stdout } = await execPromise(probeCmd);
-  const totalDuration = Math.max(parseFloat(stdout.trim()) || 0, 0);
-
-  if (totalDuration <= 0) return null;
-
-  // Se não achou silêncio, considera tudo como "fala"
-  if (silenceStarts.length === 0 && silenceEnds.length === 0) {
-    return [[0, totalDuration]];
-  }
-
-  // ranges de fala são os espaços ENTRE silêncios
-  const ranges = [];
-  let cursor = 0;
-
-  for (let i = 0; i < silenceStarts.length; i++) {
-    const startSil = silenceStarts[i];
-    const endSil = silenceEnds[i] ?? startSil;
-
-    const a = Math.max(cursor, 0);
-    const b = Math.min(startSil, totalDuration);
-
-    if (b > a) ranges.push([a, b]);
-
-    cursor = Math.min(Math.max(endSil, cursor), totalDuration);
-  }
-
-  if (cursor < totalDuration) ranges.push([cursor, totalDuration]);
-
-  // remove micro-trechos
-  const minChunk = 0.18;
-  const filtered = ranges.filter(([a, b]) => (b - a) >= minChunk);
-
-  return filtered.length ? filtered : null;
-};
-
-// Remove silêncios mantendo "pre" e "tail" (sem silêncio artificial)
-// preRollMs: pega um pouco ANTES da fala (evita cortar em cima)
-// tailMs: mantém um pouco DEPOIS da fala (respiro real)
-const removeSilences = async (inputPath, outputPath, tailMs = 650, preRollMs = 120) => {
-  const ranges = await detectSpeechRanges(inputPath);
-
-  if (!ranges || ranges.length === 0) {
-    fs.copyFileSync(inputPath, outputPath);
-    return outputPath;
-  }
-
-  // duração total
-  const probeCmd = `ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "${inputPath}"`;
-  const { stdout } = await execPromise(probeCmd);
-  const totalDuration = Math.max(parseFloat(stdout.trim()) || 0, 0);
-
-  const tailSec = tailMs / 1000;
-  const preSec = preRollMs / 1000;
-
-  // estende cada range: começa um pouco antes e termina um pouco depois
-  const extended = ranges.map(([start, end]) => {
-    const newStart = Math.max(0, start - preSec);
-    const newEnd = Math.min(end + tailSec, totalDuration);
-    return [newStart, Math.max(newStart, newEnd)];
-  });
-
-  // mescla overlaps/encostes
-  extended.sort((a, b) => a[0] - b[0]);
-  const merged = [];
-  for (const [s, e] of extended) {
-    if (!merged.length) {
-      merged.push([s, e]);
-      continue;
-    }
-    const last = merged[merged.length - 1];
-    if (s <= last[1] + 0.02) last[1] = Math.max(last[1], e);
-    else merged.push([s, e]);
-  }
-
-  // Se só 1 range, recorta simples
-  if (merged.length === 1) {
-    const [s, e] = merged[0];
-    const dur = Math.max(e - s, 0.01);
-
-    const cmd =
-      `ffmpeg -y -i "${inputPath}" ` +
-      `-ss ${s.toFixed(3)} -t ${dur.toFixed(3)} ` +
-      `-c:v libx264 -preset ultrafast -crf 28 ` +
-      `-c:a aac -b:a 128k -movflags +faststart ` +
-      `"${outputPath}"`;
-
-    await execPromise(cmd);
-    return outputPath;
-  }
-
-  // filter_complex (1 input só)
-  const filters = [];
-  let concatInputs = "";
-
-  merged.forEach(([start, end], i) => {
-    const dur = Math.max(end - start, 0.01);
-
-    filters.push(
-      `[0:v]trim=start=${start.toFixed(3)}:duration=${dur.toFixed(3)},setpts=PTS-STARTPTS[v${i}]`
-    );
-    filters.push(
-      `[0:a]atrim=start=${start.toFixed(3)}:duration=${dur.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`
-    );
-
-    concatInputs += `[v${i}][a${i}]`;
-  });
-
-  filters.push(`${concatInputs}concat=n=${merged.length}:v=1:a=1[outv][outa]`);
-  const filterComplex = filters.join(";");
-
-  const cmd =
-    `ffmpeg -y -i "${inputPath}" ` +
-    `-filter_complex "${filterComplex}" ` +
-    `-map "[outv]" -map "[outa]" ` +
-    `-c:v libx264 -preset ultrafast -crf 28 ` +
-    `-c:a aac -b:a 128k -movflags +faststart ` +
-    `"${outputPath}"`;
-
-  await execPromise(cmd);
-  return outputPath;
-};
-
-
-
 // --- ROTA PRINCIPAL DA API ---
 
 app.post("/api/process-video", upload.single("video"), async (req, res) => {
@@ -347,22 +203,11 @@ app.post("/api/process-video", upload.single("video"), async (req, res) => {
 
     for (let i = 0; i < aiClips.length; i++) {
       const clip = aiClips[i];
-     // 1) corta bruto
-const rawFilename = `corte_raw_${Date.now()}_${i}.mp4`;
-const rawPath = path.join(OUTPUTS_DIR, rawFilename);
+      const outputFilename = `corte_${Date.now()}_${i}.mp4`;
+      const outputPath = path.join(OUTPUTS_DIR, outputFilename);
 
-console.log(`Cortando bruto ${i + 1}: ${clip.start}s até ${clip.end}s`);
-await cutVideo(videoPath, rawPath, clip.start, clip.end);
-
-// 2) remove silêncios com respiro real (650ms)
-const outputFilename = `corte_${Date.now()}_${i}.mp4`;
-const outputPath = path.join(OUTPUTS_DIR, outputFilename);
-
-console.log(`Removendo silêncios do corte ${i + 1} (tail 650ms)...`);
-await removeSilences(rawPath, outputPath, 650, 120);    // respiro depois da fala,  pega antes da fala começar
-
-// 3) apaga bruto pra economizar espaço
-if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath);
+      console.log(`Cortando trecho ${i + 1}: ${clip.start}s até ${clip.end}s`);
+      await cutVideo(videoPath, outputPath, clip.start, clip.end);
 
       // Calcula a duração real em formato mm:ss
       const durationSecs = Math.round(clip.end - clip.start);
